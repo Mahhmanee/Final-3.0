@@ -786,14 +786,15 @@ def build_app() -> Application:
     return app
 
 if __name__ == "__main__":
-    # Синхронный запуск без ручного управления циклами событий (надёжно для Railway)
-    application = build_app()
+    import asyncio
 
-    async def _post_startup(_: Application):
-        await set_command_menu(application)
-        print("✅ База данных инициализирована")
+    async def main():
+        await init_db()
+        app = build_app()
+        await set_command_menu(app)
+        print("✅ Командное меню выставлено")
         print("📦 Таблицы проверены / созданы")
         print("🚀 Бот запущен")
+        await app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    application.post_init(_post_startup)
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    asyncio.run(main())
