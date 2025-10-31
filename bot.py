@@ -100,4 +100,15 @@ async def main():
     await app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    import nest_asyncio
+    nest_asyncio.apply()  # ✅ исправляет "event loop already running"
+
+    asyncio.run(init_db())
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("ticket", create_ticket))
+    app.add_handler(CommandHandler("help", help_command))
+
+    print("🚀 Бот запущен")
+    app.run_polling()  # 🚀 теперь всё стабильно
