@@ -734,7 +734,13 @@ def build_app() -> Application:
 if __name__ == "__main__":
     # 1) Инициализируем БД и пул
     asyncio.run(init_db())
-    # 2) Поднимаем приложение PTB (run_polling — синхронный блокирующий вызов)
+    # 2) Поднимаем приложение PTB (создаём event loop вручную)
+    import asyncio
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     application = build_app()
     print("🚀 Бот запущен")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
