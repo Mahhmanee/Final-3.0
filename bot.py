@@ -167,16 +167,13 @@ async def main():
     app.add_handler(CallbackQueryHandler(panel_buttons))
 
     print("🚀 Бот запущен")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    await app.updater.idle()
+    await app.run_polling()  # <- это всё, что нужно
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.get_event_loop().run_until_complete(main())
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(main())
+    import nest_asyncio
+    import asyncio
+
+    nest_asyncio.apply()  # чтобы избежать ошибки "loop already running"
+
+    asyncio.get_event_loop().run_until_complete(main())
