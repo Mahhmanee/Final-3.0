@@ -14,8 +14,8 @@ from telegram.ext import (
 )
 
 # ====== DB (PostgreSQL, psycopg3 async) ======
-from psycopg_pool import AsyncConnectionPool
-import psycopg
+import asyncpg
+db = await asyncpg.create_pool(DB_URL)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 MOD_GROUP_ID = int(os.getenv("MOD_GROUP_ID", "0"))  # -100XXXXXXXXXXXX
