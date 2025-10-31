@@ -1,1 +1,1 @@
-worker: python -X utf8 bot.py
+worker: python bot.py
