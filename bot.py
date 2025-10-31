@@ -1,23 +1,24 @@
 # bot.py
 # Telegram CRM-саппорт бот (PTB v20+ + asyncpg, Railway-ready)
-# Функции:
-# - RU/EN язык, категории
-# - Создание тикета (T-YYYYMMDD-0001), причина+описание
-# - Карточки тикетов в группе: История / Взять / Ответить / Закрыть
-# - Параллельные диалоги модераторов с пользователями
-# - Автоответчики по категориям + глобальный ON/OFF
-# - История диалога и статистика закрытий (кнопки и команды)
-# - Панель /panel: Статистика / История / Автоответчики / Проверить статус
-# - Команды /end (выйти из режима ответа модератора), /close (пользователь)
+# ✔ RU/EN язык, категории
+# ✔ Создание тикета (T-YYYYMMDD-0001), причина+описание
+# ✔ Карточки тикетов в группе: История / Взять / Ответить / Закрыть
+# ✔ Параллельные диалоги модераторов с пользователями
+# ✔ Автоответчики по категориям + глобальный ON/OFF
+# ✔ История диалога и статистика закрытий (кнопки и команды)
+# ✔ Панель /panel: Статистика / История / Автоответчики / Проверить статус
+# ✔ Команды /end (выйти из режима ответа модератора), /close (пользователь)
+# ✔ Меню команд (кнопка «⌘»/«Меню»): для ЛС и для группы модерации
 
 import os
 import asyncio
 import datetime as dt
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict
 
 import asyncpg
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup, Message, User as TgUser
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand,
+    BotCommandScopeDefault, BotCommandScopeChat, User as TgUser
 )
 from telegram.constants import ChatType
 from telegram.ext import (
@@ -26,15 +27,12 @@ from telegram.ext import (
 )
 
 # ---------------------- НАСТРОЙКИ ----------------------
-BOT_TOKEN = os.getenv(
-    "BOT_TOKEN",
-    "8351785031:AAEa4AgLciZGVO0cHm_Aa4SLqBINzbDDjao"
-)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8351785031:AAEa4AgLciZGVO0cHm_Aa4SLqBINzbDDjao")
 DB_URL = os.getenv(
     "DB_URL",
-    "postgresql://postgres:ZxdYARFdKOaFlLnOGWZISjmATBCTGGrW@ballast.proxy.rlwy.net:25766/railway"
+    "postgresql://postgres:ZxdYARFdKOaFlLnOGWZISjmATBCTGGrW@ballast.proxy.rlwy.net:25766/railway",
 )
-# ID супергруппы модерации (оставил твой из переписки)
+# ID супергруппы модерации
 MOD_GROUP_ID = int(os.getenv("MOD_GROUP_ID", "-1003173446264"))
 
 LANGS = {"ru": "Русский", "en": "English"}
@@ -44,22 +42,22 @@ CATS = {
         ("💳 Помощь с платежами", "pay"),
         ("🔄 Сброс HWID", "hwid"),
         ("🤝 Сотрудничество", "coop"),
-        ("❓ FAQ / Цены / Товары", "faq")
+        ("❓ FAQ / Цены / Товары", "faq"),
     ],
     "en": [
         ("🔧 Technical Support", "tech"),
         ("💳 Payment Help", "pay"),
         ("🔄 HWID Reset", "hwid"),
         ("🤝 Cooperation", "coop"),
-        ("❓ FAQ / Prices / Products", "faq")
-    ]
+        ("❓ FAQ / Prices / Products", "faq"),
+    ],
 }
 CAT_TITLES_RU = {
     "tech": "🔧 Техническая помощь",
-    "pay":  "💳 Помощь с платежами",
+    "pay": "💳 Помощь с платежами",
     "hwid": "🔄 Сброс HWID",
     "coop": "🤝 Сотрудничество",
-    "faq":  "❓ FAQ / Цены / Товары"
+    "faq": "❓ FAQ / Цены / Товары",
 }
 
 # Активные режимы ответа модераторов: mod_id -> ticket_id
@@ -78,17 +76,17 @@ CREATE TABLE IF NOT EXISTS users (
 );
 
 CREATE TABLE IF NOT EXISTS tickets (
-  id                 BIGSERIAL PRIMARY KEY,
-  ticket_id          TEXT UNIQUE,
-  user_id            BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
-  category           TEXT NOT NULL,
-  reason             TEXT,
-  description        TEXT,
-  status             TEXT NOT NULL DEFAULT 'open',      -- open/closed
-  created_at         TIMESTAMPTZ NOT NULL,
-  assigned_to        BIGINT,                             -- модератор id
-  closed_by          BIGINT,
-  closed_by_name     TEXT,
+  id                  BIGSERIAL PRIMARY KEY,
+  ticket_id           TEXT UNIQUE,
+  user_id             BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+  category            TEXT NOT NULL,
+  reason              TEXT,
+  description         TEXT,
+  status              TEXT NOT NULL DEFAULT 'open',      -- open/closed
+  created_at          TIMESTAMPTZ NOT NULL,
+  assigned_to         BIGINT,                             -- модератор id
+  closed_by           BIGINT,
+  closed_by_name      TEXT,
   group_header_msg_id BIGINT
 );
 
@@ -112,7 +110,6 @@ CREATE TABLE IF NOT EXISTS autoresponders (
   text     TEXT
 );
 
--- Значения по умолчанию
 INSERT INTO settings(key, value)
 VALUES ('autoresponders_enabled','1')
 ON CONFLICT (key) DO NOTHING;
@@ -191,7 +188,6 @@ async def set_autoresponder_text(category: str, text: str):
 # Tickets
 async def create_ticket(user_id: int, category: str, reason: str, description: str) -> str:
     now = dt.datetime.utcnow()
-    # Вставляем черновик, получаем seq -> делаем ticket_id -> апдейтим
     r = await db_one(
         """INSERT INTO tickets (ticket_id,user_id,category,reason,description,status,created_at)
            VALUES ('', $1, $2, $3, $4, 'open', $5)
@@ -431,12 +427,10 @@ async def pm_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     t_id = r["ticket_id"]
 
-    # Шапка
     head = f"[{t_id}] Сообщение от пользователя @{update.effective_user.username or update.effective_user.full_name} (ID: {uid}):"
     h = await context.bot.send_message(MOD_GROUP_ID, head)
     await record_msg(t_id, "system", head, None, h.message_id)
 
-    # Копируем контент (включая медиа)
     copied = await context.bot.copy_message(
         chat_id=MOD_GROUP_ID,
         from_chat_id=uid,
@@ -491,7 +485,6 @@ async def cb_ticket_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.reply_text("Тикет уже закрыт.")
             return
 
-        # Удаляем все групповые сообщения тикета
         gids = await get_ticket_group_msg_ids(ticket_id)
         for mid in gids:
             try:
@@ -509,7 +502,6 @@ async def cb_ticket_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
         await q.message.reply_text(f"✅ Тикет {ticket_id} закрыт и сообщения удалены.")
-        # если модератор был в режиме ответа — сбросить
         if active_reply.get(mod.id) == ticket_id:
             active_reply.pop(mod.id, None)
         return
@@ -517,7 +509,7 @@ async def cb_ticket_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "noop":
         return
 
-# ---------------------- ПЕРЕПИСКА МОДЕРАТОРОВ С ПОЛЬЗОВАТЕЛЕМ ----------------------
+# ---------------------- ПЕРЕПИСКА МОДЕРОВ ----------------------
 async def mod_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MOD_GROUP_ID:
         return
@@ -525,14 +517,12 @@ async def mod_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ticket_id = active_reply.get(mod_id)
     if not ticket_id:
         return
-    # Игнор команд
     if update.effective_message.text and update.effective_message.text.startswith(("/", ".")):
         return
     uid = await get_ticket_user(ticket_id)
     if not uid:
         return
 
-    # Копируем сообщение пользователю
     await context.bot.copy_message(
         chat_id=uid,
         from_chat_id=MOD_GROUP_ID,
@@ -600,8 +590,8 @@ async def cb_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.message.edit_text("Тикетов пока нет.", reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("⬅️ Назад", callback_data="p:back")]]
             ))
-            return
-        await q.message.edit_text("📜 Выберите тикет:", reply_markup=history_menu_keyboard(ids))
+        else:
+            await q.message.edit_text("📜 Выберите тикет:", reply_markup=history_menu_keyboard(ids))
         return
 
     if parts[1] == "autores":
@@ -610,7 +600,6 @@ async def cb_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if parts[1] == "status":
-        # простая проверка соединения и метрик
         r1 = await db_one("SELECT COUNT(*) AS c FROM tickets")
         r2 = await db_one("SELECT COUNT(*) AS c FROM tickets WHERE status='open'")
         r3 = await db_one("SELECT COUNT(*) AS c FROM tickets WHERE status='closed'")
@@ -707,9 +696,71 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = await stats_text()
     await update.effective_message.reply_text(txt)
 
+# ---------------------- ДОП. КОМАНДЫ (меню слева) ----------------------
+async def cmd_tickets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Выводит меню с последними тикетами (для группы модерации)."""
+    if update.effective_chat.id != MOD_GROUP_ID:
+        return
+    ids = await last_tickets(10)
+    if not ids:
+        await update.effective_message.reply_text("Тикетов пока нет.")
+        return
+    await update.effective_message.reply_text("📜 Последние тикеты:", reply_markup=history_menu_keyboard(ids))
+
+async def cmd_autoreply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Открывает меню автоответчиков (для группы модерации)."""
+    if update.effective_chat.id != MOD_GROUP_ID:
+        return
+    en = await autores_enabled()
+    await update.effective_message.reply_text("🤖 Настройки автоответчиков", reply_markup=autores_menu_keyboard(en))
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.type == ChatType.PRIVATE:
+        await update.effective_message.reply_text(
+            "Я помогу создать тикет и держать связь с модерацией.\n"
+            "Команды:\n"
+            "/start — начать\n"
+            "/close — закрыть свой последний открытый тикет"
+        )
+    elif update.effective_chat.id == MOD_GROUP_ID:
+        await update.effective_message.reply_text(
+            "Команды модерации:\n"
+            "/panel — панель управления\n"
+            "/tickets — список последних тикетов\n"
+            "/stats — статистика закрытий\n"
+            "/history <ID> — история тикета\n"
+            "/autoreply — автоответчики\n"
+            "/end — выйти из режима ответа"
+        )
+
+async def set_command_menu(app: Application):
+    """Показывает команды в кнопке «Меню» (Командное меню Telegram)."""
+    # Для ЛС с ботом
+    await app.bot.set_my_commands(
+        [
+            BotCommand("start", "Начать / выбрать язык"),
+            BotCommand("close", "Закрыть свой тикет"),
+            BotCommand("help", "Помощь"),
+        ],
+        scope=BotCommandScopeDefault(),
+    )
+    # Для группы модерации
+    await app.bot.set_my_commands(
+        [
+            BotCommand("panel", "Панель модерации"),
+            BotCommand("tickets", "Последние тикеты"),
+            BotCommand("stats", "Статистика"),
+            BotCommand("history", "История тикета"),
+            BotCommand("autoreply", "Автоответчики"),
+            BotCommand("end", "Завершить режим ответа"),
+            BotCommand("help", "Помощь по командам"),
+        ],
+        scope=BotCommandScopeChat(chat_id=MOD_GROUP_ID),
+    )
+
 # ---------------------- MAIN ----------------------
 def build_app() -> Application:
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).post_init(lambda a: init_db()).build()
 
     # Пользователь
     app.add_handler(CommandHandler("start", cmd_start, filters.ChatType.PRIVATE))
@@ -717,6 +768,7 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(cb_category, pattern=r"^cat:"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, pm_user_message))
     app.add_handler(CommandHandler("close", cmd_close_user, filters.ChatType.PRIVATE))
+    app.add_handler(CommandHandler("help", cmd_help))
 
     # Модерация
     app.add_handler(CallbackQueryHandler(cb_ticket_actions, pattern=r"^t:"))
@@ -728,26 +780,20 @@ def build_app() -> Application:
     app.add_handler(MessageHandler(filters.Chat(MOD_GROUP_ID) & filters.TEXT, mod_group_text))
     app.add_handler(CommandHandler("history", cmd_history, filters.Chat(MOD_GROUP_ID)))
     app.add_handler(CommandHandler("stats", cmd_stats, filters.Chat(MOD_GROUP_ID)))
+    app.add_handler(CommandHandler("tickets", cmd_tickets, filters.Chat(MOD_GROUP_ID)))
+    app.add_handler(CommandHandler("autoreply", cmd_autoreply, filters.Chat(MOD_GROUP_ID)))
 
     return app
-    
-if __name__ == "__main__":
-    import asyncio
 
-    async def runner():
-        await init_db()
-        app = build_app()
+if __name__ == "__main__":
+    # Синхронный запуск без ручного управления циклами событий (надёжно для Railway)
+    application = build_app()
+
+    async def _post_startup(_: Application):
+        await set_command_menu(application)
         print("✅ База данных инициализирована")
         print("📦 Таблицы проверены / созданы")
         print("🚀 Бот запущен")
-        await app.initialize()
-        await app.start()
-        try:
-            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
-            await asyncio.Event().wait()  # держим цикл живым
-        finally:
-            await app.updater.stop()
-            await app.stop()
-            await app.shutdown()
 
-    asyncio.run(runner())
+    application.post_init(_post_startup)
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
