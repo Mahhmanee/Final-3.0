@@ -58,9 +58,9 @@ POOL: Optional[AsyncConnectionPool] = None
 
 INIT_SQL = """
 CREATE TABLE IF NOT EXISTS users (
-  user_id BIGINT PRIMARY KEY,
-  username TEXT,
-  lang TEXT NOT NULL DEFAULT 'ru'
+    user_id BIGINT PRIMARY KEY,
+    lang TEXT NOT NULL DEFAULT 'ru',
+    username TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tickets (
