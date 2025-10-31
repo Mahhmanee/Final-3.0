@@ -1,2 +1,3 @@
 python-telegram-bot==20.8
 psycopg[binary,pool]==3.2.3
+nest_asyncio
