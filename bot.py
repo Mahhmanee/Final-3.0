@@ -797,4 +797,11 @@ if __name__ == "__main__":
         print("🚀 Бот запущен")
         await app.run_polling(allowed_updates=Update.ALL_TYPES)
 
-    asyncio.run(main())
+    # Вместо asyncio.run(main()) — корректный способ для уже запущенного event loop
+    try:
+        asyncio.get_event_loop().run_until_complete(main())
+    except RuntimeError:
+        # Если Railway уже запустил event loop — fallback
+        loop = asyncio.get_event_loop()
+        loop.create_task(main())
+        loop.run_forever()
