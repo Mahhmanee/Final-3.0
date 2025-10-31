@@ -10,8 +10,8 @@ from telegram.ext import (
     ContextTypes, CallbackQueryHandler, filters
 )
 
-DB_URL = "postgresql://user:password@host:port/database"
-BOT_TOKEN = "ТВОЙ_ТОКЕН"
+DB_URL = "postgresql://postgres:ZxdYARFdKOaFlLnOGWZISjmATBCTGGrW@ballast.proxy.rlwy.net:25766/railway"
+BOT_TOKEN = "8351785031:AAEa4AgLciZGVO0cHm_Aa4SLqBINzbDDjao"
 
 db = None
 
