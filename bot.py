@@ -730,17 +730,24 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("stats", cmd_stats, filters.Chat(MOD_GROUP_ID)))
 
     return app
-
+    
 if __name__ == "__main__":
     import asyncio
 
-    async def main():
-        # создаём пул соединений и таблицы
+    async def runner():
         await init_db()
-        # собираем бота
         app = build_app()
+        print("✅ База данных инициализирована")
+        print("📦 Таблицы проверены / созданы")
         print("🚀 Бот запущен")
-        # запускаем polling внутри того же event loop
-        await app.run_polling(allowed_updates=Update.ALL_TYPES)
+        await app.initialize()
+        await app.start()
+        try:
+            await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+            await asyncio.Event().wait()  # держим цикл живым
+        finally:
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
 
-    asyncio.run(main())
+    asyncio.run(runner())
