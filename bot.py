@@ -1,29 +1,27 @@
+# bot.py
 import os
 import asyncio
 import datetime as dt
 from typing import Optional, Dict, List
 
 from telegram import (
-    Update, InlineKeyboardMarkup, InlineKeyboardButton, User as TgUser
+    Update, InlineKeyboardMarkup, InlineKeyboardButton, Message, User as TgUser
 )
-from telegram.constants import ChatType
+from telegram.constants import ChatType, ParseMode
 from telegram.ext import (
-    Application, ApplicationBuilder, CommandHandler, MessageHandler,
-    CallbackQueryHandler, ContextTypes, filters
+    Application, ApplicationBuilder, ContextTypes,
+    CommandHandler, MessageHandler, CallbackQueryHandler, filters
 )
 
-# ================== НАСТРОЙКИ ==================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-MOD_GROUP_ID = int(os.getenv("MOD_GROUP_ID", "0"))
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
+# ====== DB (PostgreSQL, psycopg3 async) ======
+from psycopg_pool import AsyncConnectionPool
+import psycopg
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
-if not MOD_GROUP_ID:
-    raise RuntimeError("MOD_GROUP_ID is not set (e.g. -1001234567890)")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is not set (postgresql://...)")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+MOD_GROUP_ID = int(os.getenv("MOD_GROUP_ID", "0"))  # -100XXXXXXXXXXXX
+DATABASE_URL = os.getenv("DATABASE_URL", "")
 
+# ------------ Локальные настройки ------------
 LANGS = {"ru": "Русский", "en": "English"}
 CATS = {
     "ru": [
@@ -31,36 +29,36 @@ CATS = {
         ("💳 Помощь с платежами", "pay"),
         ("🔄 Сброс HWID", "hwid"),
         ("🤝 Сотрудничество", "coop"),
-        ("❓ FAQ / Цены / Товары", "faq")
+        ("❓ FAQ / Цены / Товары", "faq"),
     ],
     "en": [
         ("🔧 Technical Support", "tech"),
         ("💳 Payment Help", "pay"),
         ("🔄 HWID Reset", "hwid"),
         ("🤝 Cooperation", "coop"),
-        ("❓ FAQ / Prices / Products", "faq")
-    ]
+        ("❓ FAQ / Prices / Products", "faq"),
+    ],
 }
 CAT_TITLES_RU = {
     "tech": "🔧 Техническая помощь",
-    "pay":  "💳 Помощь с платежами",
+    "pay": "💳 Помощь с платежами",
     "hwid": "🔄 Сброс HWID",
     "coop": "🤝 Сотрудничество",
-    "faq":  "❓ FAQ / Цены / Товары"
+    "faq": "❓ FAQ / Цены / Товары",
 }
 
-# ================== БАЗА ДАННЫХ ==================
-import psycopg
-from psycopg.rows import dict_row
-from psycopg_pool import AsyncConnectionPool
+# Активные «режимы ответа» модераторов: mod_id -> ticket_id
+active_reply: Dict[int, str] = {}
 
 POOL: Optional[AsyncConnectionPool] = None
 
+# =============== SQL ===============
 INIT_SQL = """
+-- Безопасное создание таблиц
 CREATE TABLE IF NOT EXISTS users (
-    user_id BIGINT PRIMARY KEY,
-    lang TEXT NOT NULL DEFAULT 'ru',
-    username TEXT
+  user_id BIGINT PRIMARY KEY,
+  username TEXT,
+  lang TEXT NOT NULL DEFAULT 'ru'
 );
 
 CREATE TABLE IF NOT EXISTS tickets (
@@ -70,9 +68,9 @@ CREATE TABLE IF NOT EXISTS tickets (
   category TEXT NOT NULL,
   reason TEXT,
   description TEXT,
-  status TEXT NOT NULL DEFAULT 'open',         -- open/closed
+  status TEXT NOT NULL DEFAULT 'open',
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-  assigned_to BIGINT,                           -- id модератора, взявшего тикет
+  assigned_to BIGINT,
   closed_by BIGINT,
   closed_by_name TEXT,
   group_header_msg_id BIGINT
@@ -81,7 +79,7 @@ CREATE TABLE IF NOT EXISTS tickets (
 CREATE TABLE IF NOT EXISTS messages (
   id BIGSERIAL PRIMARY KEY,
   ticket_id TEXT NOT NULL,
-  from_role TEXT NOT NULL,                      -- 'user' | 'mod' | 'system'
+  from_role TEXT NOT NULL,           -- 'user' | 'mod' | 'system'
   text TEXT,
   user_msg_id BIGINT,
   group_msg_id BIGINT,
@@ -94,139 +92,163 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 
 CREATE TABLE IF NOT EXISTS autoresponders (
-  category TEXT PRIMARY KEY,                    -- tech|pay|hwid|coop|faq
+  category TEXT PRIMARY KEY,
   text TEXT
 );
+
+-- Дозаливаем недостающие поля (если таблицы существовали раньше)
+ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS lang TEXT;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS ticket_id TEXT;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS user_id BIGINT;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS category TEXT;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS reason TEXT;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS description TEXT;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS status TEXT;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS assigned_to BIGINT;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS closed_by BIGINT;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS closed_by_name TEXT;
+ALTER TABLE tickets ADD COLUMN IF NOT EXISTS group_header_msg_id BIGINT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS ticket_id TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS from_role TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS text TEXT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS user_msg_id BIGINT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS group_msg_id BIGINT;
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ;
+
+-- Значения по умолчанию/NOT NULL
+UPDATE tickets SET status = 'open' WHERE status IS NULL;
+ALTER TABLE tickets ALTER COLUMN status SET DEFAULT 'open';
+ALTER TABLE tickets ALTER COLUMN status SET NOT NULL;
+UPDATE tickets SET created_at = NOW() WHERE created_at IS NULL;
+ALTER TABLE tickets ALTER COLUMN created_at SET DEFAULT NOW();
+ALTER TABLE users ALTER COLUMN lang SET DEFAULT 'ru';
+
+-- Включаем автоответчики по умолчанию
+INSERT INTO settings(key,value)
+VALUES ('autoresponders_enabled', '1')
+ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value;
 """
 
-async def db_exec(sql: str, *params) -> None:
+# ========= DB helpers =========
+async def db_exec(sql: str, *params):
     async with POOL.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(sql, params)
-        await conn.commit()
+            await conn.commit()
 
-async def db_one(sql: str, *params) -> Optional[dict]:
+async def db_one(sql: str, *params):
     async with POOL.connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
+        async with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
             await cur.execute(sql, params)
             return await cur.fetchone()
 
-async def db_all(sql: str, *params) -> List[dict]:
+async def db_all(sql: str, *params):
     async with POOL.connection() as conn:
-        async with conn.cursor(row_factory=dict_row) as cur:
+        async with conn.cursor(row_factory=psycopg.rows.dict_row) as cur:
             await cur.execute(sql, params)
-            rows = await cur.fetchall()
-            return rows or []
+            return await cur.fetchall()
 
-async def init_pool_and_db(_: Application) -> None:
-    """Запускается через Application.post_init — безопасно для Railway loop."""
-    global POOL
-    if POOL is None:
-        POOL = AsyncConnectionPool(DATABASE_URL, min_size=1, max_size=5, open=False)
-        await POOL.open()
-        async with POOL.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(INIT_SQL)
-            await conn.commit()
-        # включим автоответчики по умолчанию
-        await db_exec(
-            "INSERT INTO settings(key,value) VALUES('autoresponders_enabled','1') "
-            "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value"
-        )
-        print("✅ База данных инициализирована")
-
+# ========= Модельные операции =========
 def gen_ticket_id(seq: int) -> str:
     today = dt.datetime.now().strftime("%Y%m%d")
     return f"T-{today}-{seq:04d}"
 
-async def set_user_lang(uid: int, lang: str):
-    await db_exec(
-        "INSERT INTO users(user_id,lang) VALUES(%s,%s) "
-        "ON CONFLICT(user_id) DO UPDATE SET lang=EXCLUDED.lang",
-        uid, lang
-    )
-
-async def get_user_lang(uid: int) -> str:
-    r = await db_one("SELECT lang FROM users WHERE user_id=%s", uid)
-    return (r and r["lang"]) or "ru"
-
 async def autores_enabled() -> bool:
     r = await db_one("SELECT value FROM settings WHERE key='autoresponders_enabled'")
-    return bool(r and r["value"] == "1")
+    return (r and r["value"] == "1")
 
 async def set_autores_enabled(enabled: bool):
     await db_exec(
-        "INSERT INTO settings(key,value) VALUES('autoresponders_enabled',%s) "
+        "INSERT INTO settings(key,value) VALUES('autoresponders_enabled', $1) "
         "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
-        "1" if enabled else "0"
+        "1" if enabled else "0",
     )
 
-async def get_autoresponder_text(category: str) -> Optional[str]:
-    r = await db_one("SELECT text FROM autoresponders WHERE category=%s", category)
+async def get_user_lang(uid: int) -> str:
+    r = await db_one("SELECT lang FROM users WHERE user_id=$1", uid)
+    return r["lang"] if r and r["lang"] else "ru"
+
+async def set_user_lang(uid: int, username: Optional[str], lang: str):
+    await db_exec(
+        "INSERT INTO users(user_id, username, lang) VALUES($1,$2,$3) "
+        "ON CONFLICT(user_id) DO UPDATE SET username=EXCLUDED.username, lang=EXCLUDED.lang",
+        uid, username, lang
+    )
+
+async def get_autoresponder_text(cat: str) -> Optional[str]:
+    r = await db_one("SELECT text FROM autoresponders WHERE category=$1", cat)
     return r["text"] if r else None
 
-async def set_autoresponder_text(category: str, text: str):
+async def set_autoresponder_text(cat: str, text: str):
     await db_exec(
-        "INSERT INTO autoresponders(category,text) VALUES(%s,%s) "
+        "INSERT INTO autoresponders(category,text) VALUES($1,$2) "
         "ON CONFLICT(category) DO UPDATE SET text=EXCLUDED.text",
-        category, text
+        cat, text
     )
 
 async def create_ticket(user_id: int, category: str, reason: str, description: str) -> str:
-    await db_exec(
-        "INSERT INTO tickets(user_id,category,reason,description,status) VALUES(%s,%s,%s,%s,'open')",
+    # Вставляем, получаем seq, формируем ticket_id, обновляем
+    row = await db_one(
+        "INSERT INTO tickets(user_id,category,reason,description,status) "
+        "VALUES($1,$2,$3,$4,'open') RETURNING id",
         user_id, category, reason, description
     )
-    r = await db_one("SELECT id FROM tickets WHERE user_id=%s ORDER BY id DESC LIMIT 1", user_id)
-    seq = r["id"]
+    seq = row["id"]
     t_id = gen_ticket_id(seq)
-    await db_exec("UPDATE tickets SET ticket_id=%s WHERE id=%s", t_id, seq)
+    await db_exec("UPDATE tickets SET ticket_id=$1 WHERE id=$2", t_id, seq)
     return t_id
 
 async def store_group_header(ticket_id: str, msg_id: int):
-    await db_exec("UPDATE tickets SET group_header_msg_id=%s WHERE ticket_id=%s", msg_id, ticket_id)
+    await db_exec(
+        "UPDATE tickets SET group_header_msg_id=$1 WHERE ticket_id=$2",
+        msg_id, ticket_id
+    )
 
 async def mark_assigned(ticket_id: str, mod_id: int):
-    await db_exec("UPDATE tickets SET assigned_to=%s WHERE ticket_id=%s", mod_id, ticket_id)
+    await db_exec("UPDATE tickets SET assigned_to=$1 WHERE ticket_id=$2", mod_id, ticket_id)
 
 async def get_ticket_user(ticket_id: str) -> Optional[int]:
-    r = await db_one("SELECT user_id FROM tickets WHERE ticket_id=%s", ticket_id)
+    r = await db_one("SELECT user_id FROM tickets WHERE ticket_id=$1", ticket_id)
     return r["user_id"] if r else None
 
 async def get_ticket_header(ticket_id: str) -> Optional[int]:
-    r = await db_one("SELECT group_header_msg_id FROM tickets WHERE ticket_id=%s", ticket_id)
+    r = await db_one("SELECT group_header_msg_id FROM tickets WHERE ticket_id=$1", ticket_id)
     return r["group_header_msg_id"] if r else None
 
-async def record_msg(ticket_id: str, role: str, text: str, user_msg_id: int | None, group_msg_id: int | None):
+async def record_msg(ticket_id: str, role: str, text: str,
+                     user_msg_id: Optional[int], group_msg_id: Optional[int]):
     await db_exec(
-        "INSERT INTO messages(ticket_id,from_role,text,user_msg_id,group_msg_id) VALUES(%s,%s,%s,%s,%s)",
+        "INSERT INTO messages(ticket_id,from_role,text,user_msg_id,group_msg_id) "
+        "VALUES($1,$2,$3,$4,$5)",
         ticket_id, role, text or "", user_msg_id, group_msg_id
     )
 
 async def get_ticket_group_msg_ids(ticket_id: str) -> List[int]:
     rows = await db_all(
-        "SELECT group_msg_id FROM messages WHERE ticket_id=%s AND group_msg_id IS NOT NULL",
+        "SELECT group_msg_id FROM messages WHERE ticket_id=$1 AND group_msg_id IS NOT NULL",
         ticket_id
     )
-    return [r["group_msg_id"] for r in rows if r["group_msg_id"]]
+    return [r["group_msg_id"] for r in rows if r["group_msg_id"] is not None]
 
 async def ticket_exists(ticket_id: str) -> bool:
-    r = await db_one("SELECT 1 AS ok FROM tickets WHERE ticket_id=%s", ticket_id)
-    return bool(r)
+    r = await db_one("SELECT 1 FROM tickets WHERE ticket_id=$1", ticket_id)
+    return r is not None
 
 async def ticket_status(ticket_id: str) -> Optional[str]:
-    r = await db_one("SELECT status FROM tickets WHERE ticket_id=%s", ticket_id)
+    r = await db_one("SELECT status FROM tickets WHERE ticket_id=$1", ticket_id)
     return r["status"] if r else None
 
 async def close_ticket(ticket_id: str, closed_by: Optional[int], closed_by_name: Optional[str]):
     await db_exec(
-        "UPDATE tickets SET status='closed', closed_by=%s, closed_by_name=%s WHERE ticket_id=%s",
+        "UPDATE tickets SET status='closed', closed_by=$1, closed_by_name=$2 WHERE ticket_id=$3",
         closed_by, closed_by_name, ticket_id
     )
 
-async def ticket_history_text(ticket_id: str, limit: int = 30) -> str:
+async def ticket_history_text(ticket_id: str, limit: int = 40) -> str:
     rows = await db_all(
-        "SELECT from_role, text, created_at FROM messages WHERE ticket_id=%s ORDER BY id ASC",
+        "SELECT from_role,text,created_at FROM messages WHERE ticket_id=$1 ORDER BY id ASC",
         ticket_id
     )
     if not rows:
@@ -235,51 +257,48 @@ async def ticket_history_text(ticket_id: str, limit: int = 30) -> str:
     parts = [f"📜 История по {ticket_id} (последние {len(rows)}):", ""]
     for r in rows:
         role = {"user": "👤 Пользователь", "mod": "🛠 Модератор", "system": "📎 Система"}.get(r["from_role"], r["from_role"])
-        created = r["created_at"]
-        if isinstance(created, dt.datetime):
-            created_str = created.strftime("%Y-%m-%d %H:%M:%S")
-        else:
-            created_str = str(created)
         txt = (r["text"] or "").strip()
         if len(txt) > 600:
             txt = txt[:600] + "…"
-        parts.append(f"{role} ({created_str}):\n{txt}\n")
+        parts.append(f"{role}:\n{txt}\n")
     return "\n".join(parts)
 
 async def stats_text() -> str:
-    rows = await db_all("""
+    rows = await db_all(
+        """
         SELECT COALESCE(closed_by_name, closed_by::text) AS who, COUNT(*) AS c
         FROM tickets
         WHERE status='closed' AND closed_by IS NOT NULL
         GROUP BY who
         ORDER BY c DESC
-    """)
+        """
+    )
     if not rows:
         return "📊 Пока никто не закрыл ни одного тикета."
-    total = sum(r["c"] for r in rows)
-    out = ["📊 Статистика закрытий (всё время):"]
+    out = ["📊 Статистика закрытий:"]
     for r in rows:
         out.append(f"- {r['who']}: {r['c']}")
-    out.append(f"Всего: {total}")
     return "\n".join(out)
 
-async def last_tickets(limit: int = 10) -> List[str]:
-    rows = await db_all("SELECT ticket_id FROM tickets ORDER BY id DESC LIMIT %s", limit)
+async def last_tickets(limit: int = 12) -> List[str]:
+    rows = await db_all("SELECT ticket_id FROM tickets ORDER BY id DESC LIMIT $1", limit)
     return [r["ticket_id"] for r in rows]
 
-async def open_tickets_count() -> int:
-    r = await db_one("SELECT COUNT(*) AS c FROM tickets WHERE status='open'")
-    return int(r["c"]) if r else 0
-
-# ================== КНОПКИ ==================
-def ticket_keyboard(ticket_id: str, assigned_to: Optional[int]=None) -> InlineKeyboardMarkup:
+# ========= Клавиатуры =========
+def ticket_keyboard(ticket_id: str, assigned_to: Optional[int] = None) -> InlineKeyboardMarkup:
     assigned_str = f"👨‍💻 В работе у {assigned_to}" if assigned_to else "🤷‍♂️ Свободен"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📜 История", callback_data=f"t:{ticket_id}:hist"),
          InlineKeyboardButton("✋ Взять тикет", callback_data=f"t:{ticket_id}:take")],
         [InlineKeyboardButton("✉️ Ответить", callback_data=f"t:{ticket_id}:reply"),
-         InlineKeyboardButton("✅ Закрыть", callback_data=f"t:{ticket_id}:close")],
+         InlineKeyboardButton("🛑 Завершить", callback_data=f"t:{ticket_id}:end")],
+        [InlineKeyboardButton("✅ Закрыть", callback_data=f"t:{ticket_id}:close")],
         [InlineKeyboardButton(f"{assigned_str}", callback_data=f"t:{ticket_id}:noop")]
+    ])
+
+def user_menu_keyboard(ticket_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Закрыть тикет", callback_data=f"uclose:{ticket_id}")]
     ])
 
 def panel_keyboard() -> InlineKeyboardMarkup:
@@ -287,7 +306,7 @@ def panel_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📊 Статистика", callback_data="p:stats"),
          InlineKeyboardButton("📜 История", callback_data="p:history")],
         [InlineKeyboardButton("🤖 Автоответчики", callback_data="p:autores"),
-         InlineKeyboardButton("📊 Проверить статус", callback_data="p:status")]
+         InlineKeyboardButton("📟 Проверить статус", callback_data="p:status")]
     ])
 
 def stats_keyboard() -> InlineKeyboardMarkup:
@@ -311,7 +330,7 @@ def history_menu_keyboard(ids: List[str]) -> InlineKeyboardMarkup:
 def autores_menu_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     toggle = "🔘 Автоответчики [ON]" if enabled else "⚪️ Автоответчики [OFF]"
     rows = [[InlineKeyboardButton(CAT_TITLES_RU[c], callback_data=f"ar:cat:{c}")]
-            for c in ["tech","pay","hwid","coop","faq"]]
+            for c in ["tech", "pay", "hwid", "coop", "faq"]]
     rows.append([InlineKeyboardButton(toggle, callback_data="ar:toggle")])
     rows.append([InlineKeyboardButton("⬅️ Назад", callback_data="p:back")])
     return InlineKeyboardMarkup(rows)
@@ -322,17 +341,12 @@ def autores_cat_keyboard(cat: str) -> InlineKeyboardMarkup:
         [InlineKeyboardButton("⬅️ Назад", callback_data="p:autores")]
     ])
 
-# ================== РЕЖИМ ОТВЕТА МОДЕРАТОРА ==================
-active_reply: Dict[int, str] = {}  # mod_id -> ticket_id
-
-# ================== ПОЛЬЗОВАТЕЛЬ ==================
+# ========= Пользовательский поток =========
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
-    await db_exec(
-        "INSERT INTO users(user_id,username) VALUES(%s,%s) "
-        "ON CONFLICT(user_id) DO UPDATE SET username=EXCLUDED.username",
-        uid, update.effective_user.username
-    )
+    uname = update.effective_user.username
+    # создаём пользователя с дефолтным языком (ru), username
+    await set_user_lang(uid, uname, "ru")
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("🇷🇺 Русский", callback_data="lang:ru"),
          InlineKeyboardButton("🇬🇧 English", callback_data="lang:en")]
@@ -343,7 +357,7 @@ async def cb_lang(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     lang = q.data.split(":")[1]
-    await set_user_lang(q.from_user.id, lang)
+    await set_user_lang(q.from_user.id, q.from_user.username, lang)
     cats = CATS[lang]
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(title, callback_data=f"cat:{code}")]
                                for title, code in cats])
@@ -358,8 +372,8 @@ async def cb_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cat = q.data.split(":")[1]
     context.user_data["new_ticket_cat"] = cat
     context.user_data["stage"] = "reason"
-    text = "Пожалуйста, коротко укажите причину обращения:" if lang == "ru" else "Please briefly describe your reason:"
-    await q.message.reply_text(text)
+    t = "Пожалуйста, коротко укажите причину обращения:" if lang == "ru" else "Please briefly describe your reason:"
+    await q.message.reply_text(t)
 
 async def pm_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.type != ChatType.PRIVATE:
@@ -385,9 +399,9 @@ async def pm_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t_id = await create_ticket(uid, cat, reason, description)
 
         confirm = (f"✅ Тикет {t_id} создан.\n"
-                   f"Модераторы скоро ответят здесь.\nЧтобы закрыть тикет, используйте /close") if lang == "ru" else \
-                  (f"✅ Ticket {t_id} created.\nModerators will reply here soon.\nUse /close to close the ticket.")
-        await update.effective_message.reply_text(confirm)
+                   f"Модераторы скоро ответят здесь.") if lang == "ru" else \
+                  (f"✅ Ticket {t_id} created.\nModerators will reply here soon.")
+        await update.effective_message.reply_text(confirm, reply_markup=user_menu_keyboard(t_id))
 
         header = (f"🆕 Новый тикет {t_id}\n"
                   f"Категория: {CAT_TITLES_RU.get(cat, cat)}\n"
@@ -398,21 +412,26 @@ async def pm_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await store_group_header(t_id, hmsg.message_id)
         await record_msg(t_id, "system", header, None, hmsg.message_id)
 
-        # Автоответчик по категории
+        # Автоответчик
         if await autores_enabled():
             atext = await get_autoresponder_text(cat)
             if atext:
-                await context.bot.send_message(chat_id=uid, text=atext)
+                try:
+                    await context.bot.send_message(chat_id=uid, text=atext)
+                except Exception:
+                    pass
 
-        # В историю
-        await record_msg(t_id, "user", f"[Причина] {reason}\n[Описание] {description}",
-                         update.effective_message.message_id, None)
+        # Лог
+        await record_msg(
+            t_id, "user", f"[Причина] {reason}\n[Описание] {description}",
+            update.effective_message.message_id, None
+        )
         context.user_data.clear()
         return
 
-    # 3) Доп. сообщения пользователя — пересылка в группу в открытый тикет
+    # 3) Доп.сообщения пользователя — в последний открытый тикет
     r = await db_one(
-        "SELECT ticket_id FROM tickets WHERE user_id=%s AND status='open' ORDER BY id DESC LIMIT 1",
+        "SELECT ticket_id FROM tickets WHERE user_id=$1 AND status='open' ORDER BY id DESC LIMIT 1",
         uid
     )
     if not r:
@@ -434,7 +453,7 @@ async def pm_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await record_msg(t_id, "user", text or "[media]",
                      update.effective_message.message_id, copied.message_id)
 
-# ================== КНОПКИ ТИКЕТА В ГРУППЕ ==================
+# ========= Кнопки тикета в группе =========
 async def cb_ticket_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
@@ -449,7 +468,7 @@ async def cb_ticket_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mod: TgUser = q.from_user
 
     if action == "hist":
-        txt = await ticket_history_text(ticket_id, limit=30)
+        txt = await ticket_history_text(ticket_id, limit=40)
         await q.message.reply_text(txt, reply_to_message_id=q.message.message_id)
         return
 
@@ -468,8 +487,16 @@ async def cb_ticket_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         active_reply[mod.id] = ticket_id
         await q.message.reply_text(
             f"✍️ Режим ответа включён для {ticket_id}. "
-            f"Все ваши сообщения в этой группе будут пересылаться пользователю, пока не введёте /end."
+            f"Все ваши сообщения в этой группе будут пересылаться пользователю, пока не нажмёте «🛑 Завершить»."
         )
+        return
+
+    if action == "end":
+        if active_reply.get(mod.id):
+            ended = active_reply.pop(mod.id)
+            await q.message.reply_text(f"🛑 Режим ответа для {ended} завершён.")
+        else:
+            await q.message.reply_text("У вас нет активного режима ответа.")
         return
 
     if action == "close":
@@ -485,7 +512,7 @@ async def cb_ticket_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for mid in gids:
             try:
                 await context.bot.delete_message(MOD_GROUP_ID, mid)
-                await asyncio.sleep(0.03)
+                await asyncio.sleep(0.02)
             except Exception:
                 pass
 
@@ -505,7 +532,7 @@ async def cb_ticket_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "noop":
         return
 
-# ================== СООБЩЕНИЯ ОТ МОДЕРОВ ПОЛЬЗОВАТЕЛЮ ==================
+# ========= Пересылка из группы модерации пользователю =========
 async def mod_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MOD_GROUP_ID:
         return
@@ -513,6 +540,7 @@ async def mod_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ticket_id = active_reply.get(mod_id)
     if not ticket_id:
         return
+    # игнорируем команды
     if update.effective_message.text and update.effective_message.text.startswith(("/", ".")):
         return
     uid = await get_ticket_user(ticket_id)
@@ -527,42 +555,37 @@ async def mod_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.effective_message.text or update.effective_message.caption or "[media]"
     await record_msg(ticket_id, "mod", text, None, update.effective_message.message_id)
 
-async def cmd_end(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != MOD_GROUP_ID:
-        return
-    mod_id = update.effective_user.id
-    if mod_id in active_reply:
-        ticket_id = active_reply.pop(mod_id)
-        await update.effective_message.reply_text(f"🛑 Режим ответа для {ticket_id} завершён.")
-    else:
-        await update.effective_message.reply_text("У вас нет активного режима ответа.")
-
-# ================== ЗАКРЫТИЕ СО СТОРОНЫ ПОЛЬЗОВАТЕЛЯ ==================
-async def cmd_close_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.type != ChatType.PRIVATE:
-        return
-    uid = update.effective_user.id
-    r = await db_one(
-        "SELECT ticket_id FROM tickets WHERE user_id=%s AND status='open' ORDER BY id DESC LIMIT 1", uid
-    )
+# ========= Закрытие со стороны пользователя (кнопкой) =========
+async def cb_user_close(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.message.chat.type != ChatType.PRIVATE:
+        await q.answer(); return
+    await q.answer()
+    uid = q.from_user.id
+    # ищем только открытый тикет последним
+    r = await db_one("SELECT ticket_id FROM tickets WHERE user_id=$1 AND status='open' ORDER BY id DESC LIMIT 1", uid)
     if not r:
-        await update.effective_message.reply_text("У вас нет открытых тикетов.")
+        await q.message.reply_text("У вас нет открытых тикетов.")
         return
     ticket_id = r["ticket_id"]
 
+    # удалить групповые сообщения
     gids = await get_ticket_group_msg_ids(ticket_id)
     for mid in gids:
         try:
             await context.bot.delete_message(MOD_GROUP_ID, mid)
-            await asyncio.sleep(0.03)
+            await asyncio.sleep(0.02)
         except Exception:
             pass
 
     await close_ticket(ticket_id, None, None)
-    await update.effective_message.reply_text(f"✅ Тикет {ticket_id} закрыт.")
-    await context.bot.send_message(MOD_GROUP_ID, f"❌ Тикет {ticket_id} закрыт пользователем.")
+    await q.message.reply_text(f"✅ Тикет {ticket_id} закрыт.")
+    try:
+        await context.bot.send_message(MOD_GROUP_ID, f"❌ Тикет {ticket_id} закрыт пользователем.")
+    except Exception:
+        pass
 
-# ================== ПАНЕЛЬ МОДЕРАЦИИ ==================
+# ========= Панель модерации =========
 async def cmd_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MOD_GROUP_ID:
         return
@@ -575,13 +598,13 @@ async def cb_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     parts = q.data.split(":")  # p:...
     await q.answer()
 
-    if parts[1] == "stats":
+    if parts[1] == "stats" and (len(parts) == 2 or parts[2] == "refresh"):
         txt = await stats_text()
         await q.message.edit_text(txt, reply_markup=stats_keyboard())
         return
 
     if parts[1] == "history":
-        ids = await last_tickets(limit=10)
+        ids = await last_tickets(limit=12)
         if not ids:
             await q.message.edit_text("Тикетов пока нет.", reply_markup=InlineKeyboardMarkup(
                 [[InlineKeyboardButton("⬅️ Назад", callback_data="p:back")]]
@@ -596,29 +619,20 @@ async def cb_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if parts[1] == "status":
-        # Проверка статуса: коннект к БД, размер пула, открытые тикеты
+        # Простая проверка состояния БД/пула
         try:
-            open_cnt = await open_tickets_count()
-            await q.message.edit_text(
-                f"🟢 Бот работает\n"
-                f"🗄️ База: OK\n"
-                f"🎫 Открытых тикетов: {open_cnt}",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="p:back")]])
-            )
+            r = await db_one("SELECT COUNT(*) AS c FROM tickets")
+            total = r["c"] if r else 0
+            txt = f"📟 Сервис OK\nТикетов в базе: {total}"
         except Exception as e:
-            await q.message.edit_text(
-                f"🔴 Проблема: {e}",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Назад", callback_data="p:back")]])
-            )
+            txt = f"❌ Ошибка доступа к БД: {e}"
+        await q.message.edit_text(txt, reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⬅️ Назад", callback_data="p:back")]]
+        ))
         return
 
     if parts[1] == "back":
         await q.message.edit_text("⚙️ Панель управления", reply_markup=panel_keyboard())
-        return
-
-    if parts[1] == "stats" and len(parts) >= 3 and parts[2] == "refresh":
-        txt = await stats_text()
-        await q.message.edit_text(txt, reply_markup=stats_keyboard())
         return
 
     if parts[1] == "history" and len(parts) >= 3 and parts[2] == "show":
@@ -630,7 +644,7 @@ async def cb_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(txt)
         return
 
-# ================== АВТООТВЕТЧИКИ (КНОПКИ + ВВОД) ==================
+# ========= Автоответчики =========
 async def cb_autores(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if q.message.chat.id != MOD_GROUP_ID:
@@ -674,7 +688,7 @@ async def mod_group_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.chat_data.pop("edit_autores_cat", None)
     await update.effective_message.reply_text("✅ Текст автоответа обновлён.")
 
-# ================== ИСТОРИЯ/СТАТИСТИКА КОМАНДАМИ ==================
+# ========= Команды статистики/истории (доп.) =========
 async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != MOD_GROUP_ID:
         return
@@ -685,7 +699,7 @@ async def cmd_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await ticket_exists(t_id):
         await update.effective_message.reply_text("Тикет не найден.")
         return
-    txt = await ticket_history_text(t_id, limit=50)
+    txt = await ticket_history_text(t_id, limit=60)
     await update.effective_message.reply_text(txt)
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -694,37 +708,50 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = await stats_text()
     await update.effective_message.reply_text(txt)
 
-# ================== РЕГИСТРАЦИЯ ХЕНДЛЕРОВ ==================
-def build_app() -> Application:
-    app = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .post_init(init_pool_and_db)  # инициализация пула и схемы БД без проблем с loop
-        .build()
-    )
+# ========= Инициализация =========
+async def init_db():
+    # создаём пул (без депр. предупреждения)
+    global POOL
+    if POOL is None:
+        POOL = AsyncConnectionPool(DATABASE_URL, open=False)
+        await POOL.open()
 
-    # Пользователь
+    # выполняем INIT_SQL
+    async with POOL.connection() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(INIT_SQL)
+            await conn.commit()
+
+    print("✅ База данных инициализирована")
+
+# ========= MAIN =========
+async def main():
+    if not BOT_TOKEN or not MOD_GROUP_ID or not DATABASE_URL:
+        raise RuntimeError("Заполни BOT_TOKEN, MOD_GROUP_ID и DATABASE_URL в переменных окружения")
+
+    await init_db()
+
+    app: Application = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    # Пользовательские хендлеры
     app.add_handler(CommandHandler("start", cmd_start, filters.ChatType.PRIVATE))
-    app.add_handler(CallbackQueryHandler(cb_lang, pattern="^lang:"))
-    app.add_handler(CallbackQueryHandler(cb_category, pattern="^cat:"))
+    app.add_handler(CallbackQueryHandler(cb_lang, pattern=r"^lang:"))
+    app.add_handler(CallbackQueryHandler(cb_category, pattern=r"^cat:"))
+    app.add_handler(CallbackQueryHandler(cb_user_close, pattern=r"^uclose:"))
     app.add_handler(MessageHandler(filters.ChatType.PRIVATE & ~filters.COMMAND, pm_user_message))
-    app.add_handler(CommandHandler("close", cmd_close_user, filters.ChatType.PRIVATE))
 
-    # Модерация
-    app.add_handler(CallbackQueryHandler(cb_ticket_actions, pattern="^t:"))
+    # Группа модерации
+    app.add_handler(CallbackQueryHandler(cb_ticket_actions, pattern=r"^t:"))
     app.add_handler(MessageHandler(filters.Chat(MOD_GROUP_ID) & ~filters.COMMAND, mod_group_message))
-    app.add_handler(CommandHandler("end", cmd_end, filters.Chat(MOD_GROUP_ID)))
     app.add_handler(CommandHandler("panel", cmd_panel, filters.Chat(MOD_GROUP_ID)))
-    app.add_handler(CallbackQueryHandler(cb_panel, pattern="^p:"))
-    app.add_handler(CallbackQueryHandler(cb_autores, pattern="^ar:"))
+    app.add_handler(CallbackQueryHandler(cb_panel, pattern=r"^p:"))
+    app.add_handler(CallbackQueryHandler(cb_autores, pattern=r"^ar:"))
     app.add_handler(MessageHandler(filters.Chat(MOD_GROUP_ID) & filters.TEXT, mod_group_text))
     app.add_handler(CommandHandler("history", cmd_history, filters.Chat(MOD_GROUP_ID)))
     app.add_handler(CommandHandler("stats", cmd_stats, filters.Chat(MOD_GROUP_ID)))
 
-    return app
-
-# ================== ЗАПУСК ==================
-if __name__ == "__main__":
-    app = build_app()
     print("🚀 Бот запущен")
-    app.run_polling(drop_pending_updates=True)
+    await app.run_polling(close_loop=False, allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    asyncio.run(main())
